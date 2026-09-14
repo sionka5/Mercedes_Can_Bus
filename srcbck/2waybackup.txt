@@ -1,0 +1,710 @@
+#include <Arduino.h>
+#include <string.h>
+
+#include "driver/twai.h"
+
+// ======================================================
+// ESP32-C3 + TJA1053T
+// ======================================================
+
+#define CAN_TXD_PIN        GPIO_NUM_3
+#define CAN_RXD_PIN        GPIO_NUM_2
+
+#define BUCK_ENABLE_PIN    GPIO_NUM_0
+#define TJA_STB_PIN        GPIO_NUM_6
+#define TJA_EN_PIN         GPIO_NUM_7
+
+// ======================================================
+// CAN ID
+// ======================================================
+
+static constexpr uint32_t RADIO_TO_CLUSTER_ID = 0x1A4;
+static constexpr uint32_t CLUSTER_TO_RADIO_ID = 0x1D0;
+static constexpr uint32_t CLUSTER_PAGE_ID     = 0x1CA;
+
+// ======================================================
+// CZASY
+// ======================================================
+
+static constexpr uint32_t KEEPALIVE_MS = 1000;
+
+static constexpr uint16_t FRAME_GAP_MS  = 8;
+static constexpr uint16_t REPEAT_GAP_MS = 55;
+static constexpr uint16_t ACK_TIMEOUT_MS = 30;
+
+// ======================================================
+// ROZMIARY PAKIETÓW
+// ======================================================
+
+/*
+ * HEADER:
+ *
+ * 2 bajty sterujące:
+ * 11 01
+ *
+ * 26 bajtów obszaru danych.
+ *
+ * Razem 28 bajtów = dokładnie 4 segmenty po 7 bajtów.
+ */
+static constexpr size_t HEADER_DATA_LENGTH   = 26;
+static constexpr size_t HEADER_PACKET_LENGTH = 28;
+static constexpr size_t HEADER_MAX_TEXT      = 11;
+
+/*
+ * BODY:
+ *
+ * 7 bajtów sterujących:
+ * 12 11 01 01 01 01 01
+ *
+ * 14 bajtów obszaru danych.
+ *
+ * Razem 21 bajtów = dokładnie 3 segmenty po 7 bajtów.
+ */
+static constexpr size_t BODY_DATA_LENGTH   = 14;
+static constexpr size_t BODY_PACKET_LENGTH = 21;
+static constexpr size_t BODY_MAX_TEXT      = 10;
+
+// ======================================================
+// STAN
+// ======================================================
+
+static uint8_t sequenceNibble = 0;
+
+static uint32_t nextKeepaliveMs = 0;
+
+static bool clusterRequestedKeepalive = false;
+
+static char serialBuffer[96];
+static size_t serialLength = 0;
+
+// ======================================================
+// CZAS
+// ======================================================
+
+bool due(uint32_t timestamp) {
+    return static_cast<int32_t>(millis() - timestamp) >= 0;
+}
+
+// ======================================================
+// HEX LOGGER
+// ======================================================
+
+void printHexByte(uint8_t value) {
+    if (value < 0x10) {
+        Serial.print('0');
+    }
+
+    Serial.print(value, HEX);
+}
+
+void printFrame(
+    const char* prefix,
+    const twai_message_t& frame
+) {
+    Serial.print(prefix);
+    Serial.print(" ID=0x");
+    Serial.print(frame.identifier, HEX);
+    Serial.print(" DLC=");
+    Serial.print(frame.data_length_code);
+    Serial.print(" DATA=");
+
+    for (uint8_t i = 0; i < frame.data_length_code; i++) {
+        if (i > 0) {
+            Serial.print(' ');
+        }
+
+        printHexByte(frame.data[i]);
+    }
+
+    Serial.println();
+}
+
+// ======================================================
+// ODBIÓR
+// ======================================================
+
+void processReceivedFrame(const twai_message_t& frame) {
+    if (frame.extd || frame.rtr) {
+        return;
+    }
+
+    if (frame.identifier == CLUSTER_TO_RADIO_ID) {
+        printFrame("[RX 1D0]", frame);
+
+        /*
+         * W oryginalnych logach licznik wysyła A3,
+         * a radio odpowiada A1.
+         */
+        if (
+            frame.data_length_code >= 1 &&
+            frame.data[0] == 0xA3
+        ) {
+            clusterRequestedKeepalive = true;
+        }
+
+        return;
+    }
+
+    if (frame.identifier == CLUSTER_PAGE_ID) {
+        printFrame("[RX 1CA]", frame);
+    }
+}
+
+void drainRx() {
+    twai_message_t frame;
+
+    while (twai_receive(&frame, 0) == ESP_OK) {
+        processReceivedFrame(frame);
+    }
+}
+
+void delayWithRx(uint16_t durationMs) {
+    uint32_t endTime = millis() + durationMs;
+
+    while (!due(endTime)) {
+        twai_message_t frame;
+
+        if (
+            twai_receive(
+                &frame,
+                pdMS_TO_TICKS(1)
+            ) == ESP_OK
+        ) {
+            processReceivedFrame(frame);
+        }
+    }
+
+    drainRx();
+}
+
+// ======================================================
+// OCZEKIWANIE NA 0x1D0
+// ======================================================
+
+bool waitForClusterReply(uint16_t timeoutMs) {
+    uint32_t endTime = millis() + timeoutMs;
+
+    while (!due(endTime)) {
+        twai_message_t frame;
+
+        if (
+            twai_receive(
+                &frame,
+                pdMS_TO_TICKS(1)
+            ) != ESP_OK
+        ) {
+            continue;
+        }
+
+        processReceivedFrame(frame);
+
+        if (frame.identifier == CLUSTER_TO_RADIO_ID) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// ======================================================
+// TWAI
+// ======================================================
+
+bool startCan() {
+    pinMode(BUCK_ENABLE_PIN, OUTPUT);
+    pinMode(TJA_STB_PIN, OUTPUT);
+    pinMode(TJA_EN_PIN, OUTPUT);
+
+    digitalWrite(BUCK_ENABLE_PIN, HIGH);
+
+    /*
+     * TJA1053T w Twoim układzie:
+     *
+     * EN  = HIGH
+     * STB = HIGH
+     *
+     * Tryb normalny.
+     */
+    digitalWrite(TJA_EN_PIN, HIGH);
+    digitalWrite(TJA_STB_PIN, HIGH);
+
+    delay(100);
+
+    twai_general_config_t generalConfig =
+        TWAI_GENERAL_CONFIG_DEFAULT(
+            CAN_TXD_PIN,
+            CAN_RXD_PIN,
+            TWAI_MODE_NORMAL
+        );
+
+    generalConfig.tx_queue_len = 32;
+    generalConfig.rx_queue_len = 64;
+
+    /*
+     * APB 80 MHz:
+     *
+     * 80 MHz / 48 / (1 + 15 + 4)
+     * = 83 333 bit/s
+     */
+    twai_timing_config_t timingConfig = {};
+
+    timingConfig.brp = 48;
+    timingConfig.tseg_1 = 15;
+    timingConfig.tseg_2 = 4;
+    timingConfig.sjw = 3;
+    timingConfig.triple_sampling = false;
+
+    twai_filter_config_t filterConfig =
+        TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t result = twai_driver_install(
+        &generalConfig,
+        &timingConfig,
+        &filterConfig
+    );
+
+    if (result != ESP_OK) {
+        Serial.print("[CAN] install error: ");
+        Serial.println(static_cast<int>(result));
+        return false;
+    }
+
+    result = twai_start();
+
+    if (result != ESP_OK) {
+        Serial.print("[CAN] start error: ");
+        Serial.println(static_cast<int>(result));
+
+        twai_driver_uninstall();
+        return false;
+    }
+
+    Serial.println("[CAN] TWAI 83.333 kbps");
+    Serial.println("[TJA1053T] EN=HIGH, STB=HIGH");
+
+    return true;
+}
+
+// ======================================================
+// SUROWA RAMKA
+// ======================================================
+
+bool transmitRawFrame(
+    const uint8_t data[8],
+    bool waitForReply
+) {
+    /*
+     * Usuwamy stare ramki przed wysłaniem, żeby nie uznać
+     * poprzedniej odpowiedzi za ACK nowej ramki.
+     */
+    drainRx();
+
+    twai_message_t frame = {};
+
+    frame.identifier = RADIO_TO_CLUSTER_ID;
+    frame.extd = 0;
+    frame.rtr = 0;
+    frame.data_length_code = 8;
+
+    memcpy(frame.data, data, 8);
+
+    printFrame("[TX 1A4]", frame);
+
+    esp_err_t result = twai_transmit(
+        &frame,
+        pdMS_TO_TICKS(50)
+    );
+
+    if (result != ESP_OK) {
+        Serial.print("[TX ERROR] ");
+        Serial.println(static_cast<int>(result));
+        return false;
+    }
+
+    if (waitForReply) {
+        if (!waitForClusterReply(ACK_TIMEOUT_MS)) {
+            Serial.println("[ACK] timeout");
+        }
+    }
+
+    delayWithRx(FRAME_GAP_MS);
+
+    return true;
+}
+
+// ======================================================
+// A0 / A1
+// ======================================================
+
+void sendKeepalive() {
+    const uint8_t frame[8] = {
+        0xA1, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    /*
+     * A1 jest odpowiedzią/keepalive i nie zawsze dostaje
+     * bezpośrednie potwierdzenie.
+     */
+    transmitRawFrame(frame, false);
+}
+
+void sendStartup() {
+    const uint8_t startup[8] = {
+        0xA0, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    Serial.println("[PROTOCOL] startup A0");
+
+    /*
+     * W oryginalnym logu A0 dostaje odpowiedź A1 z 0x1D0.
+     */
+    transmitRawFrame(startup, true);
+
+    Serial.println("[PROTOCOL] initial A1");
+    sendKeepalive();
+}
+
+// ======================================================
+// ZNAKI
+// ======================================================
+
+uint8_t encodeCharacter(char character) {
+    if (character >= 'a' && character <= 'z') {
+        character -= 32;
+    }
+
+    const uint8_t value = static_cast<uint8_t>(character);
+
+    if (value < 0x20 || value > 0x7E) {
+        return '?';
+    }
+
+    return value;
+}
+
+size_t copyNullTerminatedText(
+    uint8_t* destination,
+    size_t destinationLength,
+    const char* text,
+    size_t maximumTextLength
+) {
+    /*
+     * Najważniejsza zmiana:
+     *
+     * całość wypełniamy zerami, a nie spacjami.
+     */
+    memset(destination, 0x00, destinationLength);
+
+    size_t length = 0;
+
+    while (
+        text[length] != '\0' &&
+        length < maximumTextLength &&
+        length + 1 < destinationLength
+    ) {
+        destination[length] =
+            encodeCharacter(text[length]);
+
+        length++;
+    }
+
+    /*
+     * destination[length] pozostaje 0x00:
+     * prawdziwy terminator napisu.
+     */
+    return length;
+}
+
+// ======================================================
+// TRANSPORT SEGMENTOWANY
+// ======================================================
+
+bool sendLogicalPacket(
+    const uint8_t* payload,
+    size_t payloadLength
+) {
+    if (
+        payload == nullptr ||
+        payloadLength == 0 ||
+        payloadLength % 7 != 0
+    ) {
+        Serial.println(
+            "[PROTOCOL] packet length must be divisible by 7"
+        );
+
+        return false;
+    }
+
+    const size_t frameCount = payloadLength / 7;
+
+    Serial.print("[PROTOCOL] logical packet length=");
+    Serial.print(payloadLength);
+    Serial.print(" frames=");
+    Serial.println(frameCount);
+
+    size_t offset = 0;
+
+    for (size_t frameIndex = 0;
+         frameIndex < frameCount;
+         frameIndex++) {
+
+        const bool lastFrame =
+            frameIndex + 1 == frameCount;
+
+        uint8_t frame[8] = {};
+
+        /*
+         * Dolne 4 bity = kolejny numer segmentu.
+         * Bit 0x10 = ostatni segment pakietu.
+         */
+        frame[0] = sequenceNibble & 0x0F;
+
+        if (lastFrame) {
+            frame[0] |= 0x10;
+        }
+
+        memcpy(
+            &frame[1],
+            &payload[offset],
+            7
+        );
+
+        transmitRawFrame(frame, true);
+
+        sequenceNibble =
+            (sequenceNibble + 1) & 0x0F;
+
+        offset += 7;
+    }
+
+    return true;
+}
+
+// ======================================================
+// HEADER
+// ======================================================
+
+void sendHeaderOnce(const char* text) {
+    uint8_t packet[HEADER_PACKET_LENGTH] = {};
+
+    /*
+     * Logiczny pakiet:
+     *
+     * 11 01 [TEXT] 00 00 00...
+     */
+    packet[0] = 0x11;
+    packet[1] = 0x01;
+
+    copyNullTerminatedText(
+        &packet[2],
+        HEADER_DATA_LENGTH,
+        text,
+        HEADER_MAX_TEXT
+    );
+
+    Serial.print("[HEADER] ");
+    Serial.println(text);
+
+    sendLogicalPacket(
+        packet,
+        sizeof(packet)
+    );
+}
+
+void sendHeader(const char* text) {
+    sendHeaderOnce(text);
+
+    delayWithRx(REPEAT_GAP_MS);
+
+    sendHeaderOnce(text);
+}
+
+// ======================================================
+// BODY
+// ======================================================
+
+void sendBodyOnce(const char* text) {
+    uint8_t packet[BODY_PACKET_LENGTH] = {};
+
+    /*
+     * Logiczny pakiet:
+     *
+     * 12 11 01 01 01 01 01 [TEXT] 00 00...
+     */
+    packet[0] = 0x12;
+    packet[1] = 0x11;
+
+    packet[2] = 0x01;
+    packet[3] = 0x01;
+    packet[4] = 0x01;
+    packet[5] = 0x01;
+    packet[6] = 0x01;
+
+    copyNullTerminatedText(
+        &packet[7],
+        BODY_DATA_LENGTH,
+        text,
+        BODY_MAX_TEXT
+    );
+
+    Serial.print("[BODY] ");
+    Serial.println(text);
+
+    sendLogicalPacket(
+        packet,
+        sizeof(packet)
+    );
+}
+
+void sendBody(const char* text) {
+    sendBodyOnce(text);
+
+    delayWithRx(REPEAT_GAP_MS);
+
+    sendBodyOnce(text);
+}
+
+// ======================================================
+// AKTUALIZACJA HEADER-BODY
+// ======================================================
+
+void updateDisplay(char* command) {
+    char* separator = strchr(command, '-');
+
+    if (separator == nullptr) {
+        Serial.println("ERR: FORMAT HEADER-BODY");
+        return;
+    }
+
+    *separator = '\0';
+
+    const char* header = command;
+    const char* body = separator + 1;
+
+    if (header[0] != '\0') {
+        sendHeader(header);
+        delayWithRx(60);
+    }
+
+    if (body[0] != '\0') {
+        sendBody(body);
+    }
+
+    Serial.println("OK");
+}
+
+// ======================================================
+// SERIAL
+// ======================================================
+
+void processSerialCommand(char* command) {
+    if (strcmp(command, "startup") == 0) {
+        sendStartup();
+        return;
+    }
+
+    if (strcmp(command, "keepalive") == 0) {
+        sendKeepalive();
+        return;
+    }
+
+    if (strcmp(command, "test") == 0) {
+        sendHeader("AUDIO");
+        delayWithRx(80);
+        sendBody("TEST1");
+        return;
+    }
+
+    updateDisplay(command);
+}
+
+void readSerial() {
+    while (Serial.available()) {
+        const char character = Serial.read();
+
+        if (character == '\r') {
+            continue;
+        }
+
+        if (character == '\n') {
+            serialBuffer[serialLength] = '\0';
+
+            if (serialLength > 0) {
+                processSerialCommand(serialBuffer);
+            }
+
+            serialLength = 0;
+            return;
+        }
+
+        if (serialLength < sizeof(serialBuffer) - 1) {
+            serialBuffer[serialLength++] = character;
+        }
+    }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(800);
+
+    Serial.println();
+    Serial.println("==================================");
+    Serial.println("W209 AUDIO10 PROTOCOL EMULATOR");
+    Serial.println("NULL-TERMINATED TEXT");
+    Serial.println("==================================");
+    Serial.println("FORMAT: HEADER-BODY");
+
+    if (!startCan()) {
+        Serial.println("[FATAL] TWAI start failed");
+
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    sendStartup();
+
+    nextKeepaliveMs = millis() + KEEPALIVE_MS;
+
+    sendHeader("AUDIO");
+
+    delayWithRx(80);
+
+    sendBody("TEST1");
+
+    Serial.println("READY");
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+    readSerial();
+    drainRx();
+
+    /*
+     * Licznik poprosił o odpowiedź A1 przez A3.
+     */
+    if (clusterRequestedKeepalive) {
+        clusterRequestedKeepalive = false;
+
+        Serial.println("[PROTOCOL] cluster A3 -> radio A1");
+
+        sendKeepalive();
+
+        nextKeepaliveMs = millis() + KEEPALIVE_MS;
+    }
+
+    if (due(nextKeepaliveMs)) {
+        sendKeepalive();
+
+        nextKeepaliveMs = millis() + KEEPALIVE_MS;
+    }
+}

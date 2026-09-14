@@ -1,0 +1,1007 @@
+#include <Arduino.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "driver/twai.h"
+
+// ======================================================
+// ESP32-C3 + TJA1053T PINY
+// ======================================================
+
+#define CAN_TXD_PIN        GPIO_NUM_3
+#define CAN_RXD_PIN        GPIO_NUM_2
+
+#define BUCK_ENABLE_PIN    0
+#define TJA_STB_PIN        6
+#define TJA_EN_PIN         7
+
+// ======================================================
+// USTAWIENIA
+// ======================================================
+
+static const uint32_t KEEPALIVE_MS = 1000;
+
+static const uint32_t CAN_IDLE_SLEEP_MS = 5000;
+static const uint32_t STARTUP_SLEEP_ARM_MS = 5000;
+
+static const uint32_t BUTTON_ARM_DELAY_MS = 1000;
+static const uint32_t BUTTON_DEBOUNCE_MS  = 300;
+static const uint32_t TEL_BUTTON_DEBOUNCE_MS = 300;
+
+static const uint32_t PC_HEARTBEAT_TIMEOUT_MS = 3000;
+
+static const uint16_t FRAME_GAP_MS = 8;
+static const uint16_t REPEAT_GAP_MS = 55;
+
+static const uint8_t HEADER_VISIBLE = 11;
+static const uint8_t BODY_VISIBLE   = 10;
+
+static const uint8_t HEADER_PACKET_LEN = 26;
+static const uint8_t BODY_PACKET_LEN   = 14;
+
+static const int8_t HEADER_OFFSET = 4;
+static const int8_t BODY_OFFSET   = 2;
+
+static const uint8_t PAD = 0x20;
+
+static const uint8_t BTN_RELEASE = 0x00;
+static const uint8_t BTN_NONE    = 0xFF;
+
+static const uint8_t BTN_BRIGHTNESS_UP   = 0x30;
+static const uint8_t BTN_BRIGHTNESS_DOWN = 0x31;
+
+// ======================================================
+// SERIAL PROTOCOL
+// ======================================================
+
+static const uint8_t SOF1 = 0xAA;
+static const uint8_t SOF2 = 0x55;
+
+// Android -> ESP
+static const uint8_t MSG_HEARTBEAT = 0x11;
+static const uint8_t MSG_SET_TEXT  = 0x12;
+
+// ESP -> Android
+static const uint8_t MSG_BUTTON    = 0x20;
+static const uint8_t MSG_STATUS    = 0x21;
+static const uint8_t MSG_ACK       = 0x7F;
+
+static const uint8_t ACK_OK              = 0x00;
+static const uint8_t ACK_BAD_PAYLOAD     = 0x01;
+static const uint8_t ACK_UNKNOWN_TYPE    = 0x02;
+static const uint8_t ACK_RADIO_OFF       = 0x03;
+
+static const uint8_t PROTO_MAX_LEN       = 180;
+
+uint8_t protoTxSeq = 1;
+
+// ======================================================
+// KEY STATE
+// ======================================================
+
+enum KeyState {
+    KEY_UNKNOWN  = 0,
+    KEY_OUT      = 1,
+    KEY_INSERTED = 2,
+    KEY_POS1     = 3,
+    KEY_IGNITION = 4
+};
+
+KeyState keyState = KEY_UNKNOWN;
+
+bool radioTxEnabled = false;
+bool pcHeartbeatAlive = false;
+
+uint32_t lastPcHeartbeatMs = 0;
+
+char currentHeader[32] = "RADIO";
+char currentBody[32]   = "OFF";
+
+bool radioStartupPending = false;
+bool displayRefreshPending = false;
+
+// ======================================================
+// BUTTON STATE
+// ======================================================
+
+uint32_t buttonsArmAtMs = 0;
+uint32_t lastButtonEventMs = 0;
+uint32_t lastTelButtonMs = 0;
+
+uint8_t lastButtonKey = BTN_NONE;
+bool seenRealButtonSinceArm = false;
+
+// ======================================================
+// GLOBAL
+// ======================================================
+
+uint8_t seqNibble = 0;
+
+uint32_t nextKeepaliveMs = 0;
+uint32_t lastCanActivityMs = 0;
+uint32_t bootMs = 0;
+
+bool shuttingDown = false;
+bool canReady = false;
+
+// ======================================================
+// TIME
+// ======================================================
+
+bool due(uint32_t t) {
+    return (int32_t)(millis() - t) >= 0;
+}
+
+bool elapsed(uint32_t since, uint32_t interval) {
+    return (uint32_t)(millis() - since) >= interval;
+}
+
+// ======================================================
+// CRC8
+// ======================================================
+
+uint8_t crc8_update(uint8_t crc, uint8_t data) {
+    crc ^= data;
+
+    for (uint8_t i = 0; i < 8; i++) {
+        if (crc & 0x80) {
+            crc = (crc << 1) ^ 0x07;
+        } else {
+            crc <<= 1;
+        }
+    }
+
+    return crc;
+}
+
+uint8_t crc8_calc(uint8_t len, const uint8_t* data) {
+    uint8_t crc = 0;
+    crc = crc8_update(crc, len);
+
+    for (uint8_t i = 0; i < len; i++) {
+        crc = crc8_update(crc, data[i]);
+    }
+
+    return crc;
+}
+
+// ======================================================
+// SERIAL PROTOCOL TX
+// ======================================================
+
+void protoSend(uint8_t type, const uint8_t* payload, uint8_t payloadLen) {
+    if (payloadLen > PROTO_MAX_LEN - 2) return;
+
+    uint8_t len = 2 + payloadLen;
+
+    uint8_t tmp[PROTO_MAX_LEN];
+    tmp[0] = protoTxSeq++;
+    if (protoTxSeq == 0) protoTxSeq = 1;
+
+    tmp[1] = type;
+
+    for (uint8_t i = 0; i < payloadLen; i++) {
+        tmp[2 + i] = payload[i];
+    }
+
+    uint8_t crc = crc8_calc(len, tmp);
+
+    Serial.write(SOF1);
+    Serial.write(SOF2);
+    Serial.write(len);
+    Serial.write(tmp, len);
+    Serial.write(crc);
+    Serial.flush();
+}
+
+void protoAck(uint8_t ackedSeq, uint8_t ackedType, uint8_t status) {
+    uint8_t p[3] = { ackedSeq, ackedType, status };
+    protoSend(MSG_ACK, p, 3);
+}
+
+void protoSendStatus() {
+    uint8_t p[3];
+
+    p[0] = (uint8_t)keyState;
+    p[1] = radioTxEnabled ? 1 : 0;
+    p[2] = pcHeartbeatAlive ? 1 : 0;
+
+    protoSend(MSG_STATUS, p, 3);
+}
+
+void protoSendButton(uint8_t key) {
+    if (!pcHeartbeatAlive) return;
+
+    uint8_t p[1] = { key };
+    protoSend(MSG_BUTTON, p, 1);
+}
+
+// ======================================================
+// SEQ
+// ======================================================
+
+uint8_t seqNormal(uint8_t add) {
+    return (seqNibble + add) & 0x0F;
+}
+
+uint8_t seqTail(uint8_t add) {
+    return 0x10 | ((seqNibble + add) & 0x0F);
+}
+
+void advanceSeq(uint8_t n) {
+    seqNibble = (seqNibble + n) & 0x0F;
+}
+
+// ======================================================
+// TEXT
+// ======================================================
+
+uint8_t encodeChar(char c) {
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) return 0x20;
+    return (uint8_t)c;
+}
+
+uint8_t textLenLimited(const char* text, uint8_t maxLen) {
+    uint8_t len = 0;
+    while (text[len] && len < maxLen) len++;
+    return len;
+}
+
+int clampInt(int v, int minV, int maxV) {
+    if (v < minV) return minV;
+    if (v > maxV) return maxV;
+    return v;
+}
+
+void fillText(uint8_t* out, uint8_t packetLen, uint8_t visibleLen, const char* text, int8_t offset) {
+    memset(out, PAD, packetLen);
+
+    uint8_t len = textLenLimited(text, visibleLen);
+
+    int start = ((int)visibleLen - (int)len) / 2 + offset;
+    int maxStart = (int)visibleLen - (int)len;
+
+    start = clampInt(start, 0, maxStart);
+
+    for (uint8_t i = 0; i < len; i++) {
+        out[start + i] = encodeChar(text[i]);
+    }
+}
+
+// ======================================================
+// POWER / TJA1053T
+// ======================================================
+
+void buckOn() {
+    pinMode(BUCK_ENABLE_PIN, OUTPUT);
+    digitalWrite(BUCK_ENABLE_PIN, HIGH);
+}
+
+void buckOff() {
+    digitalWrite(BUCK_ENABLE_PIN, LOW);
+}
+
+void tjaPinsInit() {
+    pinMode(TJA_STB_PIN, OUTPUT);
+    pinMode(TJA_EN_PIN, OUTPUT);
+
+    digitalWrite(TJA_STB_PIN, LOW);
+    digitalWrite(TJA_EN_PIN, LOW);
+
+    delay(20);
+}
+
+void tjaNormalMode() {
+    digitalWrite(TJA_STB_PIN, HIGH);
+    digitalWrite(TJA_EN_PIN, HIGH);
+
+    delay(20);
+}
+
+void tjaSleepMode() {
+    pinMode((int)CAN_TXD_PIN, INPUT_PULLUP);
+    pinMode((int)CAN_RXD_PIN, INPUT);
+
+    // go-to-sleep command
+    digitalWrite(TJA_EN_PIN, HIGH);
+    digitalWrite(TJA_STB_PIN, LOW);
+    delay(2);
+
+    // sleep
+    digitalWrite(TJA_EN_PIN, LOW);
+    digitalWrite(TJA_STB_PIN, LOW);
+    delay(20);
+}
+
+void powerOffEsp() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    radioTxEnabled = false;
+    pcHeartbeatAlive = false;
+
+    if (canReady) {
+        twai_stop();
+        twai_driver_uninstall();
+        canReady = false;
+    }
+
+    tjaSleepMode();
+
+    delay(50);
+
+    buckOff();
+
+    while (true) {
+        delay(1000);
+    }
+}
+
+// ======================================================
+// TWAI / CAN 83.333 kbps
+// ======================================================
+
+bool setupCan() {
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        CAN_TXD_PIN,
+        CAN_RXD_PIN,
+        TWAI_MODE_NORMAL
+    );
+
+    twai_timing_config_t t_config;
+    t_config.brp = 48;
+    t_config.tseg_1 = 15;
+    t_config.tseg_2 = 4;
+    t_config.sjw = 3;
+    t_config.triple_sampling = false;
+
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err;
+
+    err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    err = twai_start();
+    if (err != ESP_OK) {
+        twai_driver_uninstall();
+        return false;
+    }
+
+    canReady = true;
+    return true;
+}
+
+// ======================================================
+// CAN RX/TX
+// ======================================================
+
+void markCanActivity() {
+    lastCanActivityMs = millis();
+}
+
+void delayWithRx(uint16_t ms);
+
+void sendFrame(uint16_t id, uint8_t dlc, const uint8_t* data) {
+    if (!radioTxEnabled) return;
+    if (!canReady) return;
+
+    twai_message_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.identifier = id;
+    msg.extd = 0;
+    msg.rtr = 0;
+    msg.data_length_code = dlc;
+
+    for (uint8_t i = 0; i < dlc; i++) {
+        msg.data[i] = data[i];
+    }
+
+    twai_transmit(&msg, pdMS_TO_TICKS(20));
+
+    delayWithRx(FRAME_GAP_MS);
+}
+
+void send1A4(
+    uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3,
+    uint8_t d4, uint8_t d5, uint8_t d6, uint8_t d7
+) {
+    uint8_t d[8] = { d0, d1, d2, d3, d4, d5, d6, d7 };
+    sendFrame(0x1A4, 8, d);
+}
+
+// ======================================================
+// AUDIO 10 EMU
+// ======================================================
+
+void sendKeepalive() {
+    send1A4(
+        0xA1, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    );
+}
+
+void sendStartup() {
+    send1A4(
+        0xA0, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    );
+
+    sendKeepalive();
+}
+
+void sendHeaderOnce(const char* text) {
+    uint8_t p[HEADER_PACKET_LEN];
+    fillText(p, HEADER_PACKET_LEN, HEADER_VISIBLE, text, HEADER_OFFSET);
+
+    uint8_t s0 = seqNormal(0);
+    uint8_t s1 = seqNormal(1);
+    uint8_t s2 = seqNormal(2);
+    uint8_t s3 = seqTail(3);
+
+    send1A4(s0, 0x11, 0x01, p[0],  p[1],  p[2],  p[3],  p[4]);
+    send1A4(s1, p[5],  p[6],  p[7],  p[8],  p[9],  p[10], p[11]);
+    send1A4(s2, p[12], p[13], p[14], p[15], p[16], p[17], p[18]);
+    send1A4(s3, p[19], p[20], p[21], p[22], p[23], p[24], p[25]);
+
+    advanceSeq(4);
+}
+
+void sendBodyOnce(const char* text) {
+    uint8_t p[BODY_PACKET_LEN];
+    fillText(p, BODY_PACKET_LEN, BODY_VISIBLE, text, BODY_OFFSET);
+
+    uint8_t s0 = seqNormal(0);
+    uint8_t s1 = seqNormal(1);
+    uint8_t s2 = seqTail(2);
+
+    send1A4(s0, 0x12, 0x11, 0x01, 0x01, 0x01, 0x01, 0x01);
+    send1A4(s1, p[0],  p[1],  p[2],  p[3],  p[4],  p[5],  p[6]);
+    send1A4(s2, p[7],  p[8],  p[9],  p[10], p[11], p[12], p[13]);
+
+    advanceSeq(3);
+}
+
+void sendHeader(const char* text) {
+    sendHeaderOnce(text);
+    delayWithRx(REPEAT_GAP_MS);
+    sendHeaderOnce(text);
+}
+
+void sendBody(const char* text) {
+    sendBodyOnce(text);
+    delayWithRx(REPEAT_GAP_MS);
+    sendBodyOnce(text);
+}
+
+void requestDisplayRefresh() {
+    displayRefreshPending = true;
+}
+
+void setDisplayRadioOff() {
+    strncpy(currentHeader, "RADIO", sizeof(currentHeader) - 1);
+    currentHeader[sizeof(currentHeader) - 1] = '\0';
+
+    strncpy(currentBody, "OFF", sizeof(currentBody) - 1);
+    currentBody[sizeof(currentBody) - 1] = '\0';
+}
+
+void showCurrentRadioState() {
+    if (!radioTxEnabled) return;
+
+    if (pcHeartbeatAlive) {
+        sendHeader(currentHeader);
+        delayWithRx(80);
+        sendBody(currentBody);
+    } else {
+        sendHeader("RADIO");
+        delayWithRx(80);
+        sendBody("OFF");
+    }
+}
+
+void serviceRadioDisplay() {
+    if (!radioTxEnabled) {
+        radioStartupPending = false;
+        displayRefreshPending = false;
+        return;
+    }
+
+    if (radioStartupPending) {
+        radioStartupPending = false;
+
+        sendStartup();
+        delayWithRx(60);
+
+        displayRefreshPending = true;
+    }
+
+    if (displayRefreshPending) {
+        displayRefreshPending = false;
+        showCurrentRadioState();
+    }
+}
+
+void onHeartbeatArrived() {
+    lastPcHeartbeatMs = millis();
+
+    if (!pcHeartbeatAlive) {
+        pcHeartbeatAlive = true;
+
+        strncpy(currentHeader, "CONNECTED", sizeof(currentHeader) - 1);
+        currentHeader[sizeof(currentHeader) - 1] = '\0';
+
+        strncpy(currentBody, "NO META", sizeof(currentBody) - 1);
+        currentBody[sizeof(currentBody) - 1] = '\0';
+
+        requestDisplayRefresh();
+        protoSendStatus();
+    }
+}
+
+void onHeartbeatLost() {
+    if (!pcHeartbeatAlive) return;
+
+    pcHeartbeatAlive = false;
+    setDisplayRadioOff();
+
+    requestDisplayRefresh();
+    protoSendStatus();
+}
+
+void checkPcHeartbeat() {
+    if (!pcHeartbeatAlive) return;
+
+    if (elapsed(lastPcHeartbeatMs, PC_HEARTBEAT_TIMEOUT_MS)) {
+        onHeartbeatLost();
+    }
+}
+
+// ======================================================
+// KEY DETECTION
+// ======================================================
+
+KeyState decodeKeyState(uint8_t b0) {
+    switch (b0) {
+        case 0x00: return KEY_OUT;
+        case 0x01: return KEY_INSERTED;
+        case 0x03: return KEY_POS1;
+        case 0x0F: return KEY_IGNITION;
+        default:   return KEY_UNKNOWN;
+    }
+}
+
+bool shouldRadioTxRun(KeyState s) {
+    return (
+        s == KEY_POS1 ||
+        s == KEY_IGNITION
+    );
+}
+
+void resetButtonDebounce() {
+    buttonsArmAtMs = millis() + BUTTON_ARM_DELAY_MS;
+    lastButtonEventMs = 0;
+    lastTelButtonMs = 0;
+    lastButtonKey = BTN_NONE;
+    seenRealButtonSinceArm = false;
+}
+
+void radioStart() {
+    if (radioTxEnabled) return;
+
+    radioTxEnabled = true;
+    nextKeepaliveMs = millis() + KEEPALIVE_MS;
+
+    resetButtonDebounce();
+
+    radioStartupPending = true;
+    displayRefreshPending = true;
+
+    protoSendStatus();
+}
+
+void radioStop() {
+    if (!radioTxEnabled) return;
+
+    radioTxEnabled = false;
+    nextKeepaliveMs = 0;
+
+    buttonsArmAtMs = 0;
+    lastButtonKey = BTN_NONE;
+    seenRealButtonSinceArm = false;
+
+    radioStartupPending = false;
+    displayRefreshPending = false;
+
+    protoSendStatus();
+}
+
+void parseKeyFrame(const twai_message_t& rx) {
+    if (rx.identifier != 0x000) return;
+    if (rx.data_length_code < 1) return;
+
+    KeyState newState = decodeKeyState(rx.data[0]);
+
+    if (newState == KEY_UNKNOWN) return;
+    if (newState == keyState) return;
+
+    bool wasRadioRun = shouldRadioTxRun(keyState);
+    bool nowRadioRun = shouldRadioTxRun(newState);
+
+    keyState = newState;
+
+    if (!wasRadioRun && nowRadioRun) {
+        radioStart();
+    }
+
+    if (wasRadioRun && !nowRadioRun) {
+        radioStop();
+    }
+
+    protoSendStatus();
+}
+
+// ======================================================
+// BUTTONS
+// ======================================================
+
+bool buttonsAreArmed() {
+    if (!radioTxEnabled) return false;
+    if (!pcHeartbeatAlive) return false;
+    if (buttonsArmAtMs == 0) return false;
+
+    return due(buttonsArmAtMs);
+}
+
+// ======================================================
+// STEERING BUTTONS 0x1D0
+// ======================================================
+
+void onButtonEvent(uint8_t key) {
+    if (!pcHeartbeatAlive) return;
+    protoSendButton(key);
+}
+
+void parseButtonFrame(const twai_message_t& rx) {
+    if (rx.identifier != 0x1D0) return;
+    if (rx.data_length_code < 4) return;
+
+    if (!buttonsAreArmed()) {
+        return;
+    }
+
+    uint8_t key = rx.data[3];
+    uint32_t now = millis();
+
+    if (!seenRealButtonSinceArm && key == BTN_RELEASE) {
+        lastButtonKey = BTN_RELEASE;
+        return;
+    }
+
+    if (key == lastButtonKey) {
+        return;
+    }
+
+    if (key == BTN_RELEASE) {
+        lastButtonKey = BTN_RELEASE;
+        onButtonEvent(key);
+        return;
+    }
+
+    if (lastButtonEventMs != 0 && (now - lastButtonEventMs) < BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+
+    lastButtonEventMs = now;
+    lastButtonKey = key;
+    seenRealButtonSinceArm = true;
+
+    onButtonEvent(key);
+}
+
+// ======================================================
+// TEL BUTTONS 0x1A8
+// ======================================================
+void parseTelButtonFrame(const twai_message_t& rx) {
+    if (rx.identifier != 0x1A8) return;
+    if (rx.data_length_code < 2) return;
+
+    if (!buttonsAreArmed()) {
+        return;
+    }
+
+    uint8_t b0 = rx.data[0];
+    uint8_t b1 = rx.data[1];
+
+    uint32_t now = millis();
+
+    if (lastTelButtonMs != 0 && (now - lastTelButtonMs) < TEL_BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+
+    // TEL pickup:
+    // 0x1A8 40 00
+    // 0x1A8 00 00
+    // brightness UP
+    if (b0 == 0x40 && b1 == 0x00) {
+        lastTelButtonMs = now;
+        protoSendButton(BTN_BRIGHTNESS_UP);
+        return;
+    }
+
+    // TEL hang:
+    // u Ciebie leci:
+    // 0x1A8 10 00
+    // 0x1A8 80 00
+    //
+    // Dajemy oba jako DOWN, debounce zablokuje dubla.
+    if ((b0 == 0x80) && b1 == 0x00) {
+        lastTelButtonMs = now;
+        protoSendButton(BTN_BRIGHTNESS_DOWN);
+        return;
+    }
+
+    // 00 00 = release / idle
+}
+// ======================================================
+// CAN RX
+// ======================================================
+
+void drainRx() {
+    if (!canReady) return;
+
+    twai_message_t rx;
+    bool gotAnything = false;
+
+    while (twai_receive(&rx, 0) == ESP_OK) {
+        gotAnything = true;
+
+        parseKeyFrame(rx);
+        parseButtonFrame(rx);
+        parseTelButtonFrame(rx);
+    }
+
+    if (gotAnything) {
+        markCanActivity();
+    }
+}
+
+void delayWithRx(uint16_t ms) {
+    uint32_t until = millis() + ms;
+
+    while (!due(until)) {
+        drainRx();
+        delay(1);
+    }
+
+    drainRx();
+}
+
+// ======================================================
+// PC COMMAND HANDLING
+// ======================================================
+
+void copyLimitedText(char* dst, size_t dstSize, const uint8_t* src, uint8_t len, const char* fallback) {
+    if (dstSize == 0) return;
+
+    if (len == 0) {
+        strncpy(dst, fallback, dstSize - 1);
+        dst[dstSize - 1] = '\0';
+        return;
+    }
+
+    uint8_t n = len;
+    if (n > dstSize - 1) n = dstSize - 1;
+
+    for (uint8_t i = 0; i < n; i++) {
+        char c = (char)src[i];
+
+        if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) {
+            c = ' ';
+        }
+
+        dst[i] = c;
+    }
+
+    dst[n] = '\0';
+}
+
+uint8_t handleHeartbeat(const uint8_t* payload, uint8_t payloadLen) {
+    if (payloadLen != 0) {
+        return ACK_BAD_PAYLOAD;
+    }
+
+    onHeartbeatArrived();
+    return ACK_OK;
+}
+
+uint8_t handleSetText(const uint8_t* payload, uint8_t payloadLen) {
+    if (!pcHeartbeatAlive) {
+        return ACK_RADIO_OFF;
+    }
+
+    if (payloadLen < 2) {
+        return ACK_BAD_PAYLOAD;
+    }
+
+    uint8_t hLen = payload[0];
+    uint8_t bLen = payload[1];
+
+    if ((uint16_t)2 + hLen + bLen != payloadLen) {
+        return ACK_BAD_PAYLOAD;
+    }
+
+    const uint8_t* hPtr = payload + 2;
+    const uint8_t* bPtr = payload + 2 + hLen;
+
+    copyLimitedText(currentHeader, sizeof(currentHeader), hPtr, hLen, "CONNECTED");
+    copyLimitedText(currentBody,   sizeof(currentBody),   bPtr, bLen, "NO META");
+
+    requestDisplayRefresh();
+
+    return ACK_OK;
+}
+
+void handleProtocolPacket(uint8_t seq, uint8_t type, const uint8_t* payload, uint8_t payloadLen) {
+    if (type == MSG_ACK) {
+        return;
+    }
+
+    uint8_t status = ACK_OK;
+
+    switch (type) {
+        case MSG_HEARTBEAT:
+            status = handleHeartbeat(payload, payloadLen);
+            protoAck(seq, type, status);
+            break;
+
+        case MSG_SET_TEXT:
+            status = handleSetText(payload, payloadLen);
+            protoAck(seq, type, status);
+
+            if (status == ACK_OK) {
+                protoSendStatus();
+            }
+            break;
+
+        default:
+            status = ACK_UNKNOWN_TYPE;
+            protoAck(seq, type, status);
+            break;
+    }
+}
+
+// ======================================================
+// SERIAL PROTOCOL RX
+// ======================================================
+
+void readSerialProtocol() {
+    static uint8_t state = 0;
+    static uint8_t len = 0;
+    static uint8_t idx = 0;
+    static uint8_t buf[PROTO_MAX_LEN + 1];
+
+    while (Serial.available()) {
+        uint8_t b = Serial.read();
+
+        switch (state) {
+            case 0:
+                if (b == SOF1) state = 1;
+                break;
+
+            case 1:
+                if (b == SOF2) {
+                    state = 2;
+                } else if (b == SOF1) {
+                    state = 1;
+                } else {
+                    state = 0;
+                }
+                break;
+
+            case 2:
+                len = b;
+
+                if (len < 2 || len > PROTO_MAX_LEN) {
+                    state = 0;
+                    break;
+                }
+
+                idx = 0;
+                state = 3;
+                break;
+
+            case 3:
+                buf[idx++] = b;
+
+                if (idx >= len + 1) {
+                    uint8_t receivedCrc = buf[len];
+                    uint8_t calcCrc = crc8_calc(len, buf);
+
+                    if (receivedCrc == calcCrc) {
+                        uint8_t seq = buf[0];
+                        uint8_t type = buf[1];
+
+                        const uint8_t* payload = buf + 2;
+                        uint8_t payloadLen = len - 2;
+
+                        handleProtocolPacket(seq, type, payload, payloadLen);
+                    }
+
+                    state = 0;
+                }
+                break;
+        }
+    }
+}
+
+// ======================================================
+// SLEEP CHECK
+// ======================================================
+
+void checkCanSleep() {
+    if (!elapsed(bootMs, STARTUP_SLEEP_ARM_MS)) {
+        return;
+    }
+
+    if (keyState != KEY_OUT) {
+        return;
+    }
+
+    if (elapsed(lastCanActivityMs, CAN_IDLE_SLEEP_MS)) {
+        powerOffEsp();
+    }
+}
+
+// ======================================================
+// SETUP / LOOP
+// ======================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(800);
+
+    bootMs = millis();
+    lastCanActivityMs = millis();
+
+    buckOn();
+    tjaPinsInit();
+    tjaNormalMode();
+
+    if (!setupCan()) {
+        delay(1000);
+        powerOffEsp();
+    }
+
+    pcHeartbeatAlive = false;
+    lastPcHeartbeatMs = 0;
+
+    setDisplayRadioOff();
+
+    protoSendStatus();
+}
+
+void loop() {
+    readSerialProtocol();
+
+    drainRx();
+
+    checkPcHeartbeat();
+
+    serviceRadioDisplay();
+
+    if (radioTxEnabled && due(nextKeepaliveMs)) {
+        sendKeepalive();
+        nextKeepaliveMs = millis() + KEEPALIVE_MS;
+    }
+
+    drainRx();
+
+    readSerialProtocol();
+
+    checkCanSleep();
+}
