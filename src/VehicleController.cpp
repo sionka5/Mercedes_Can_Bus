@@ -24,6 +24,7 @@ VehicleController::VehicleController()
       lastCanActivityMs_(0),
       lastHeartbeatMs_(0),
       nextKeepaliveMs_(0),
+      nextDisplayRefreshMs_(0),
       buttonsArmAtMs_(0),
       lastButtonEventMs_(0),
       buttonPressedAtMs_(0),
@@ -42,6 +43,21 @@ VehicleController::VehicleController()
 
     setAudioOff();
     setTelephoneReady(false);
+}
+
+uint8_t VehicleController::refreshMaskForActivePage() const {
+    switch (activePage_) {
+        case AndroidProtocol::PAGE_TELEPHONE:
+            return RefreshTelephone;
+
+        case AndroidProtocol::PAGE_NAVIGATION:
+            return RefreshNavigation;
+
+        case AndroidProtocol::PAGE_AUDIO:
+        case AndroidProtocol::PAGE_UNKNOWN:
+        default:
+            return RefreshAudio;
+    }
 }
 
 bool VehicleController::due(uint32_t timestamp) {
@@ -98,6 +114,15 @@ void VehicleController::service() {
         can_.sendKeepalive();
         nextKeepaliveMs_ =
             millis() + Config::KEEPALIVE_MS;
+    }
+
+    if (
+        radioEnabled_ &&
+        due(nextDisplayRefreshMs_)
+    ) {
+        requestRefresh(refreshMaskForActivePage());
+        nextDisplayRefreshMs_ =
+            millis() + Config::DISPLAY_REFRESH_MS;
     }
 
     if (
@@ -494,6 +519,8 @@ void VehicleController::startRadio() {
     clusterRequestedKeepalive_ = false;
     nextKeepaliveMs_ =
         millis() + Config::KEEPALIVE_MS;
+    nextDisplayRefreshMs_ =
+        millis() + Config::DISPLAY_REFRESH_MS;
 
     resetButtonState();
     activePage_ = AndroidProtocol::PAGE_UNKNOWN;
@@ -512,6 +539,7 @@ void VehicleController::stopRadio() {
 
     clusterRequestedKeepalive_ = false;
     nextKeepaliveMs_ = 0;
+    nextDisplayRefreshMs_ = 0;
 
     startupPending_ = false;
     refreshMask_ = RefreshNone;
@@ -732,6 +760,7 @@ void VehicleController::shutdown() {
 
     can_.setTransmitEnabled(false);
     can_.stop();
+    nextDisplayRefreshMs_ = 0;
 
     power_.cutPower();
 }

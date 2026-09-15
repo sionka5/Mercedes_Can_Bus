@@ -85,6 +85,7 @@ private:
     uint32_t lastCanActivityMs_;
     uint32_t lastHeartbeatMs_;
     uint32_t nextKeepaliveMs_;
+    uint32_t nextDisplayRefreshMs_;
 
     uint32_t buttonsArmAtMs_;
     uint32_t lastButtonEventMs_;
@@ -128,6 +129,7 @@ private:
 
     bool buttonsArmed() const;
     static bool isRepeatableButton(uint8_t button);
+    uint8_t refreshMaskForActivePage() const;
     void resetButtonState();
     void sendButton(uint8_t page, uint8_t button);
 

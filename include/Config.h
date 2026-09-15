@@ -18,6 +18,7 @@ constexpr uint32_t RADIO_TO_CLUSTER_ID = 0x1A4;
 constexpr uint32_t CLUSTER_TO_RADIO_ID = 0x1D0;
 
 constexpr uint32_t KEEPALIVE_MS = 1000;
+constexpr uint32_t DISPLAY_REFRESH_MS = 1500;
 constexpr uint16_t FRAME_GAP_MS = 8;
 constexpr uint16_t PAGE_PACKET_GAP_MS = 8;
 constexpr uint16_t AUDIO_HEADER_BODY_GAP_MS = 80;
