@@ -6,6 +6,8 @@
 #include "TextEncoding.h"
 #include "Watchdog.h"
 
+#define TOP_AMBIENT 21
+
 VehicleController::VehicleController()
     : power_(),
       can_(),
@@ -32,6 +34,11 @@ VehicleController::VehicleController()
       lastTelephoneButtonMs_(0),
       lastButton_(BUTTON_NONE),
       seenButtonSinceArm_(false),
+      currentRpm_(0),
+      currentSpeed_(0.0f),
+      currentAmbientPwm_(0),
+      userMaxAmbientPercent_(100),
+      lastTelemetryMs_(0),
       currentHeader_{},
       currentBody_{},
       telephoneBody1_{},
@@ -79,6 +86,9 @@ void VehicleController::begin() {
     Serial.begin(115200);
     delay(800);
 
+    pinMode(TOP_AMBIENT, OUTPUT);
+    analogWrite(TOP_AMBIENT, 0);
+
     Watchdog::begin();
     Watchdog::feed();
 
@@ -99,12 +109,17 @@ void VehicleController::begin() {
 void VehicleController::service() {
     Watchdog::feed();
 
-    // Najpierw szybko odbieramy dane z Androida i CAN.
     android_.poll();
     can_.poll();
 
     checkHeartbeatTimeout();
     serviceDisplays();
+
+    // Wysyłanie telemetrii do Androida co 100ms
+    if (radioEnabled_ && elapsed(lastTelemetryMs_, 100)) {
+        lastTelemetryMs_ = millis();
+        android_.sendTelemetry(currentRpm_, currentSpeed_, currentAmbientPwm_, userMaxAmbientPercent_);
+    }
 
     if (
         radioEnabled_ &&
@@ -152,14 +167,41 @@ void VehicleController::onCanFrame(
     parseSteeringButton(frame);
     parseTelephoneButton(frame);
 
+    // 1. Obroty silnika (RPM) - ID 0x002
+    if (frame.identifier == 0x002 && frame.data_length_code >= 4) {
+        currentRpm_ = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
+    }
+
+    // 2. Prędkość pojazdu (km/h) - ID 0x003 lub 0x10A
+    if ((frame.identifier == 0x003 || frame.identifier == 0x10A) && frame.data_length_code >= 4) {
+        uint16_t rawSpeed = static_cast<uint16_t>((frame.data[2] << 8) | frame.data[3]);
+        currentSpeed_ = static_cast<float>(rawSpeed) / 16.0f;
+    }
+
+    // 3. Jasność ambientów - ID 0x00C
+    if (frame.identifier == 0x00C && frame.data_length_code >= 1) {
+        uint8_t rawBrightness = frame.data[0];
+        if (rawBrightness > 100) {
+            rawBrightness = 100;
+        }
+
+        if (rawBrightness == 0) {
+            currentAmbientPwm_ = 0;
+        } else {
+            constexpr uint8_t baseMaxPwm = 31; // Ekwiwalent 8% z 5V przeskalowany na 3.3V ESP32
+            uint8_t dynamicMaxPwm = static_cast<uint8_t>((baseMaxPwm * userMaxAmbientPercent_) / 100);
+            currentAmbientPwm_ = static_cast<uint8_t>(map(rawBrightness, 0, 100, 0, dynamicMaxPwm));
+        }
+
+        analogWrite(TOP_AMBIENT, currentAmbientPwm_);
+    }
+
     if (
         frame.identifier ==
             Config::CLUSTER_TO_RADIO_ID &&
         frame.data_length_code >= 1 &&
         frame.data[0] == 0xA3
     ) {
-        // Nie wysyłamy A1 z callbacka.
-        // Tylko ustawiamy flagę, by uniknąć rekurencji.
         clusterRequestedKeepalive_ = true;
     }
 }
@@ -221,12 +263,10 @@ uint8_t VehicleController::onAndroidSetText(
         "NO META"
     );
 
-    // Android zmienia obecnie tylko AUDIO.
     requestRefresh(RefreshAudio);
 
     return AndroidProtocol::ACK_OK;
 }
-
 
 uint8_t VehicleController::onAndroidSetTelephone(
     const uint8_t* payload,
@@ -291,6 +331,18 @@ uint8_t VehicleController::onAndroidSetTelephone(
     return AndroidProtocol::ACK_OK;
 }
 
+uint8_t VehicleController::onAndroidSetAmbientMax(
+    const uint8_t* payload,
+    uint8_t payloadLength
+) {
+    if (payload == nullptr || payloadLength < 1) {
+        return AndroidProtocol::ACK_BAD_PAYLOAD;
+    }
+
+    userMaxAmbientPercent_ = constrain(payload[0], 0, 100);
+    return AndroidProtocol::ACK_OK;
+}
+
 void VehicleController::requestRefresh(uint8_t mask) {
     refreshMask_ |= mask;
 }
@@ -312,9 +364,6 @@ void VehicleController::serviceDisplays() {
         requestRefresh(RefreshAll);
     }
 
-    // Jedna strona na jedno wejście do serviceDisplays().
-    // Dzięki temu połączenie z Androidem nie blokuje pętli
-    // przez kilka stron naraz.
     if (refreshMask_ & RefreshAudio) {
         const bool ok = heartbeatAlive_
             ? audio_.show(currentHeader_, currentBody_)
@@ -387,7 +436,6 @@ void VehicleController::setAudioConnected() {
     currentBody_[sizeof(currentBody_) - 1] = '\0';
 }
 
-
 void VehicleController::setTelephoneReady(bool ready) {
     telephoneBody1_[0] = '\0';
 
@@ -412,7 +460,6 @@ void VehicleController::heartbeatArrived() {
     setAudioConnected();
     setTelephoneReady(true);
 
-    // Tylko flagi. Brak transmisji CAN wewnątrz parsera Serial.
     requestRefresh(RefreshAll);
     sendStatus();
 }
@@ -601,7 +648,6 @@ void VehicleController::parseSteeringButton(
         return;
     }
 
-    // ACK Bx/9x nie może zostać uznany za przycisk.
     if (
         frame.data[0] != 0xAF ||
         frame.data[1] != 0x01

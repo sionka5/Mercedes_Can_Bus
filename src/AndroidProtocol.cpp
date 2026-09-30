@@ -1,5 +1,7 @@
 #include "AndroidProtocol.h"
 
+#include <string.h>
+
 AndroidProtocol::AndroidProtocol(Stream& serial)
     : serial_(serial),
       handler_(nullptr),
@@ -82,8 +84,6 @@ void AndroidProtocol::sendPacket(
     serial_.write(length);
     serial_.write(data, length);
     serial_.write(crc);
-
-    // Bez Serial.flush(): nie blokujemy pętli przy każdym ACK.
 }
 
 void AndroidProtocol::sendAck(
@@ -119,6 +119,21 @@ void AndroidProtocol::sendButton(uint8_t page, uint8_t button) {
     sendPacket(MSG_BUTTON, payload, sizeof(payload));
 }
 
+void AndroidProtocol::sendTelemetry(
+    uint16_t rpm,
+    float speed,
+    uint8_t currentAmbientPwm,
+    uint8_t maxAmbientPercent
+) {
+    uint8_t payload[8];
+    memcpy(&payload[0], &rpm, 2);
+    memcpy(&payload[2], &speed, 4);
+    payload[6] = currentAmbientPwm;
+    payload[7] = maxAmbientPercent;
+
+    sendPacket(MSG_TELEMETRY, payload, sizeof(payload));
+}
+
 void AndroidProtocol::handlePacket(
     uint8_t sequence,
     uint8_t type,
@@ -149,6 +164,13 @@ void AndroidProtocol::handlePacket(
 
             case MSG_SET_TELEPHONE:
                 status = handler_->onAndroidSetTelephone(
+                    payload,
+                    payloadLength
+                );
+                break;
+
+            case MSG_SET_AMBIENT_MAX:
+                status = handler_->onAndroidSetAmbientMax(
                     payload,
                     payloadLength
                 );
@@ -207,8 +229,6 @@ void AndroidProtocol::poll() {
                 break;
 
             case 3:
-                // packetBuffer_ ma MAX_LENGTH + 1:
-                // dane długości packetLength_ oraz końcowy CRC.
                 if (packetIndex_ > MAX_LENGTH) {
                     resetParser();
                     break;

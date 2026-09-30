@@ -19,6 +19,11 @@ public:
         uint8_t payloadLength
     ) = 0;
 
+    virtual uint8_t onAndroidSetAmbientMax(
+        const uint8_t* payload,
+        uint8_t payloadLength
+    ) = 0;
+
     virtual ~AndroidProtocolHandler() = default;
 };
 
@@ -45,8 +50,15 @@ public:
         bool heartbeatAlive
     );
 
-    // ESP -> Android: payload [page, button].
     void sendButton(uint8_t page, uint8_t button);
+    
+    // ESP -> Android: wysyłka telemetrii (RPM, Prędkość, PWM, Limit %)
+    void sendTelemetry(
+        uint16_t rpm,
+        float speed,
+        uint8_t currentAmbientPwm,
+        uint8_t maxAmbientPercent
+    );
 
 private:
     static constexpr uint8_t SOF1 = 0xAA;
@@ -56,10 +68,12 @@ private:
     static constexpr uint8_t MSG_HEARTBEAT = 0x11;
     static constexpr uint8_t MSG_SET_TEXT = 0x12;
     static constexpr uint8_t MSG_SET_TELEPHONE = 0x13;
+    static constexpr uint8_t MSG_SET_AMBIENT_MAX = 0x05;
 
     // ESP -> Android
     static constexpr uint8_t MSG_BUTTON = 0x20;
     static constexpr uint8_t MSG_STATUS = 0x21;
+    static constexpr uint8_t MSG_TELEMETRY = 0x04;
     static constexpr uint8_t MSG_ACK = 0x7F;
 
     static constexpr uint8_t MAX_LENGTH = 180;

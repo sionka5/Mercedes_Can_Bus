@@ -36,6 +36,11 @@ public:
         uint8_t payloadLength
     ) override;
 
+    uint8_t onAndroidSetAmbientMax(
+        const uint8_t* payload,
+        uint8_t payloadLength
+    ) override;
+
 private:
     enum class KeyState : uint8_t {
         Unknown = 0,
@@ -95,6 +100,13 @@ private:
 
     uint8_t lastButton_;
     bool seenButtonSinceArm_;
+
+    // Telemetria i Ambient
+    uint16_t currentRpm_;
+    float currentSpeed_;
+    uint8_t currentAmbientPwm_;
+    uint8_t userMaxAmbientPercent_;
+    uint32_t lastTelemetryMs_;
 
     char currentHeader_[32];
     char currentBody_[32];
