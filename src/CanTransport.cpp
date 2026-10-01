@@ -242,6 +242,8 @@ CanTransport::AckResult CanTransport::waitForAck(
         if (frame.data[0] == retry) {
             return AckResult::Retry;
         }
+
+        Watchdog::feed();
     }
 
     return AckResult::Timeout;
